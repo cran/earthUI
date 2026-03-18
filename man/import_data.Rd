@@ -4,7 +4,7 @@
 \alias{import_data}
 \title{Import data from CSV or Excel files}
 \usage{
-import_data(filepath, sheet = 1, ...)
+import_data(filepath, sheet = 1, sep = ",", dec = ".", ...)
 }
 \arguments{
 \item{filepath}{Character string. Path to the data file. Supported formats:
@@ -12,6 +12,12 @@ import_data(filepath, sheet = 1, ...)
 
 \item{sheet}{Character or integer. For Excel files, the sheet to read.
 Defaults to the first sheet. Ignored for CSV files.}
+
+\item{sep}{Character. Field separator for CSV files. Default \code{","}.
+Use \code{";"} for European-style CSVs.}
+
+\item{dec}{Character. Decimal separator for CSV files. Default \code{"."}.
+Use \code{","} for European-style CSVs.}
 
 \item{...}{Additional arguments passed to \code{\link[utils:read.table]{utils::read.csv()}} or
 \code{\link[readxl:read_excel]{readxl::read_excel()}}.}
@@ -25,10 +31,8 @@ Reads a CSV (.csv) or 'Excel' (.xlsx, .xls) file and returns a data frame.
 Column names are converted to snake_case and duplicates are made unique.
 }
 \examples{
-# Create a temporary CSV for demonstration
-tmp <- tempfile(fileext = ".csv")
-write.csv(mtcars, tmp, row.names = FALSE)
-df <- import_data(tmp)
+# Load the included demo appraisal dataset
+demo_file <- system.file("extdata", "Appraisal_1.csv", package = "earthUI")
+df <- import_data(demo_file)
 head(df)
-unlink(tmp)
 }

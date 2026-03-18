@@ -6,6 +6,20 @@ function(input, output, session) {
     earthUI:::settings_db_disconnect_(settings_con)
   })
 
+  # --- Nord theme switching ---
+  observe({
+    mode <- input$dark_mode
+    req(mode)
+    tryCatch(
+      session$setCurrentTheme(
+        if (mode == "dark") nord_dark else nord_light
+      ),
+      error = function(e) {
+        message("Theme switch error (non-fatal): ", conditionMessage(e))
+      }
+    )
+  })
+
   # --- Write fitting log to output folder ---
   write_fit_log_ <- function(output_folder, lines, file_name) {
     tryCatch({
@@ -24,6 +38,27 @@ function(input, output, session) {
     })
   }
 
+  # --- Auto-export earth result for mgcvUI (degree <= 2) ---
+  auto_export_for_mgcv_ <- function(result, output_folder, file_name) {
+    tryCatch({
+      deg <- result$degree %||% 1L
+      if (deg > 2L) return(invisible(NULL))
+      folder <- if (is.null(output_folder) || !nzchar(output_folder)) {
+        path.expand("~/Downloads")
+      } else {
+        output_folder
+      }
+      if (!dir.exists(folder)) dir.create(folder, recursive = TRUE)
+      base <- tools::file_path_sans_ext(file_name %||% "earth")
+      out_path <- file.path(folder, paste0(base, "_earthUI_result_",
+                            format(Sys.time(), "%Y%m%d_%H%M%S"), ".rds"))
+      saveRDS(result, out_path)
+      message("earthUI: auto-exported result for mgcvUI to ", out_path)
+    }, error = function(e) {
+      message("earthUI: auto-export for mgcvUI failed: ", e$message)
+    })
+  }
+
   # --- Reactive values ---
   rv <- reactiveValues(
     data = NULL,
@@ -39,7 +74,11 @@ function(input, output, session) {
     trace_lines = character(0),
     user_varmod = "lm",       # user's explicit varmod.method choice
     wp_weights = NULL,         # per-target response weights (numeric vector or NULL)
-    subset_conditions = list() # condition rows for subset filter builder
+    subset_conditions = list(), # condition rows for subset filter builder
+    rca_df = NULL,             # RCA export data for histogram plots
+    rca_targets = NULL,        # target variable names for RCA plots
+    sg_recommended = NULL,     # recommended comps for sales grid
+    sg_others = NULL           # other comps for sales grid
   )
 
   # Track user's explicit varmod.method changes
@@ -57,6 +96,65 @@ function(input, output, session) {
     } else {
       updateSelectInput(session, "varmod_method", selected = rv$user_varmod)
     }
+  })
+
+  # --- Locale ---
+  # Load user's locale defaults from SQLite on startup
+  locale_defaults <- earthUI:::settings_db_read_(settings_con, "__locale_defaults__")
+  if (!is.null(locale_defaults) && length(locale_defaults$settings) > 0L) {
+    ld <- locale_defaults$settings
+    if (!is.null(ld$locale_country))  updateSelectInput(session, "locale_country",  selected = ld$locale_country)
+    if (!is.null(ld$locale_paper))    updateSelectInput(session, "locale_paper",    selected = ld$locale_paper)
+    if (!is.null(ld$locale_csv_sep))  updateSelectInput(session, "locale_csv_sep",  selected = ld$locale_csv_sep)
+    if (!is.null(ld$locale_dec))      updateSelectInput(session, "locale_dec",      selected = ld$locale_dec)
+    if (!is.null(ld$locale_date))     updateSelectInput(session, "locale_date",     selected = ld$locale_date)
+    message("earthUI: restored locale defaults from SQLite")
+  }
+
+  # Save locale as user default
+  observeEvent(input$locale_save_default, {
+    locale_settings <- list(
+      locale_country = input$locale_country,
+      locale_paper   = input$locale_paper,
+      locale_csv_sep = input$locale_csv_sep,
+      locale_dec     = input$locale_dec,
+      locale_date    = input$locale_date
+    )
+    earthUI:::settings_db_write_(
+      settings_con, "__locale_defaults__",
+      settings = jsonlite::toJSON(locale_settings, auto_unbox = TRUE)
+    )
+    showNotification("Locale saved as default for all new files.",
+                     type = "message", duration = 4)
+  })
+
+  # When country changes, update override dropdowns to country defaults
+  observeEvent(input$locale_country, {
+    country <- input$locale_country %||% "us"
+    presets <- earthUI:::locale_country_presets_()
+    preset <- presets[[country]] %||% presets[["us"]]
+    updateSelectInput(session, "locale_csv_sep", selected = preset$csv_sep)
+    updateSelectInput(session, "locale_dec",     selected = preset$csv_dec)
+    updateSelectInput(session, "locale_date",    selected = preset$date_fmt)
+    updateSelectInput(session, "locale_paper",   selected = preset$paper)
+    # Determine big_mark from decimal: if dec is "," use country's big_mark
+    earthUI:::set_locale_(country)
+  })
+
+  # When any override changes, update locale env directly
+  observe({
+    csv_sep  <- input$locale_csv_sep %||% ","
+    csv_dec  <- input$locale_dec     %||% "."
+    date_fmt <- input$locale_date    %||% "mdy"
+    paper    <- input$locale_paper   %||% "letter"
+    # Derive big_mark from decimal mark (they must differ)
+    country <- input$locale_country %||% "us"
+    presets <- earthUI:::locale_country_presets_()
+    preset <- presets[[country]] %||% presets[["us"]]
+    big_mark <- preset$big_mark
+    earthUI:::set_locale_(country, csv_sep = csv_sep, csv_dec = csv_dec,
+                          big_mark = big_mark, dec_mark = csv_dec,
+                          date_fmt = date_fmt, paper = paper)
   })
 
   # --- Data Import ---
@@ -88,7 +186,9 @@ function(input, output, session) {
       rv$sheets <- NULL
     }
     tryCatch({
-      rv$data <- import_data(input$file_input$datapath, sheet = 1)
+      rv$data <- import_data(input$file_input$datapath, sheet = 1,
+                               sep = earthUI:::locale_csv_sep_(),
+                               dec = earthUI:::locale_csv_dec_())
       rv$categoricals <- detect_categoricals(rv$data)
       rv$col_types <- detect_types(rv$data)
       rv$result <- NULL
@@ -107,7 +207,9 @@ function(input, output, session) {
 
   observeEvent(input$sheet, {
     req(rv$file_path, input$sheet)
-    rv$data <- import_data(rv$file_path, sheet = input$sheet)
+    rv$data <- import_data(rv$file_path, sheet = input$sheet,
+                             sep = earthUI:::locale_csv_sep_(),
+                             dec = earthUI:::locale_csv_dec_())
     rv$categoricals <- detect_categoricals(rv$data)
     rv$col_types <- detect_types(rv$data)
     rv$result <- NULL
@@ -128,7 +230,7 @@ function(input, output, session) {
   outputOptions(output, "model_fitted", suspendWhenHidden = FALSE)
 
   output$report_heading <- renderUI({
-    n <- if (identical(input$purpose, "appraisal")) "8" else "7"
+    n <- if (identical(input$purpose, "appraisal")) "9" else "7"
     h4(paste0(n, ". Download Report"))
   })
 
@@ -795,7 +897,11 @@ function(input, output, session) {
     appraiser <- input$purpose %in% c("appraisal", "market")
 
     # Special column options
-    special_options <- c("no", "contract_date", "latitude", "longitude", "living_area", "display_only")
+    special_options <- c("no", "actual_age", "area", "concessions",
+                         "contract_date", "display_only", "dom",
+                         "effective_age", "latitude", "listing_date",
+                         "living_area", "longitude", "lot_size",
+                         "site_dimensions")
 
     # Header row
     header_cols <- list(
@@ -844,7 +950,9 @@ function(input, output, session) {
       # Build row cells
       row_cells <- list(
         tags$div(style = "flex: 1; min-width: 100px; font-size: 0.82em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                 title = col, col),
+                 title = col, col,
+                 tags$span(id = paste0("eui_special_badge_", i),
+                           style = "font-size: 0.7em; color: #0d6efd; font-style: italic; margin-left: 4px;")),
         tags$div(style = "width: 85px; text-align: center;",
                  tags$select(id = paste0("eui_type_", i),
                              class = "eui-type-select",
@@ -972,6 +1080,7 @@ function(input, output, session) {
 
         // Restore saved state, then sync to Shiny
         restoreState();
+        updateBadges();
         setTimeout(gatherState, 200);
 
         // On any checkbox change, save and sync
@@ -993,6 +1102,19 @@ function(input, output, session) {
           if (typeof window.euiSaveToServer === 'function') window.euiSaveToServer(storageKeyRaw);
         });
 
+        // Update special type badges next to variable names
+        function updateBadges() {
+          if (!appraiser) return;
+          for (var j = 1; j <= n; j++) {
+            var sp = $('#eui_special_' + j).val() || 'no';
+            var $badge = $('#eui_special_badge_' + j);
+            if ($badge.length) {
+              $badge.text(sp !== 'no' ? '[' + sp + ']' : '');
+            }
+          }
+        }
+        window.euiUpdateBadges = updateBadges;
+
         // On special dropdown change: enforce single per special type, save and sync
         $(document).off('change.euispecial').on('change.euispecial', '.eui-special-select', function() {
           var idx = parseInt(this.id.replace('eui_special_', ''));
@@ -1005,6 +1127,7 @@ function(input, output, session) {
               }
             }
           }
+          updateBadges();
           saveState();
           gatherState();
           if (typeof window.euiSaveToServer === 'function') window.euiSaveToServer(storageKeyRaw);
@@ -1420,6 +1543,8 @@ function(input, output, session) {
       }
       rv$trace_lines <- character(0)
       rv$result <- NULL
+      rv$rca_df <- NULL
+      rv$rca_targets <- NULL
 
       rv$bg_proc <- callr::r_bg(
         function(args) {
@@ -1494,6 +1619,8 @@ function(input, output, session) {
           session$sendCustomMessage("fitting_done",
             list(text = sprintf("Done in %.1fs", elapsed)))
           write_fit_log_(input$output_folder, rv$result$trace_output, rv$file_name)
+          # Auto-export for mgcvUI (degree <= 2)
+          auto_export_for_mgcv_(rv$result, input$output_folder, rv$file_name)
         }, error = function(e) {
           session$sendCustomMessage("fitting_done",
             list(text = "Error"))
@@ -1563,6 +1690,8 @@ function(input, output, session) {
             list(text = sprintf("Done in %.1fs", result$elapsed)))
           # Write log file on success
           write_fit_log_(input$output_folder, rv$trace_lines, rv$file_name)
+          # Auto-export for mgcvUI (degree <= 2)
+          auto_export_for_mgcv_(result, input$output_folder, rv$file_name)
         }, error = function(e) {
           # Extract the real error from callr's wrapper
           err_msg <- e$message
@@ -1949,6 +2078,80 @@ function(input, output, session) {
     dt
   })
 
+  # --- Results: RCA Adjustment Percentage Histograms ---
+  output$rca_plots_ui <- renderUI({
+    req(rv$rca_df, rv$rca_targets)
+    df <- rv$rca_df
+    targets <- rv$rca_targets
+
+    # Build plot outputs for each target
+    plot_tags <- list()
+    for (ti in seq_along(targets)) {
+      tgt <- targets[ti]
+      if (ti == 1L) {
+        pct_cols <- list(
+          list(col = "residual_pct",  label = "Residual Adj %"),
+          list(col = "net_adj_pct",   label = "Net Adj %"),
+          list(col = "gross_adj_pct", label = "Gross Adj %")
+        )
+      } else {
+        pct_cols <- list(
+          list(col = paste0(tgt, "_residual_pct"),  label = paste0(tgt, " Residual Adj %")),
+          list(col = paste0(tgt, "_net_adj_pct"),   label = paste0(tgt, " Net Adj %")),
+          list(col = paste0(tgt, "_gross_adj_pct"), label = paste0(tgt, " Gross Adj %"))
+        )
+      }
+      for (pc in pct_cols) {
+        plot_id <- paste0("rca_hist_", gsub("[^a-zA-Z0-9]", "_", pc$col))
+        local({
+          col_name <- pc$col
+          plot_label <- pc$label
+          output[[plot_id]] <- renderPlot({
+            vals <- rv$rca_df[[col_name]]
+            vals <- vals[!is.na(vals) & is.finite(vals)]
+            if (length(vals) == 0L) return(NULL)
+            pct_vals <- vals * 100
+            avg_val <- mean(pct_vals)
+            med_val <- stats::median(pct_vals)
+            sd_val  <- stats::sd(pct_vals)
+            bin_width <- 5
+            rng <- range(pct_vals)
+            brks <- seq(floor(rng[1] / bin_width) * bin_width,
+                        ceiling(rng[2] / bin_width) * bin_width,
+                        by = bin_width)
+            if (length(brks) < 2L) brks <- c(brks[1], brks[1] + bin_width)
+            hist_data <- graphics::hist(pct_vals, breaks = brks, plot = FALSE)
+            y_max <- max(hist_data$counts) * 1.25
+            graphics::par(mar = c(5, 4, 4, 2) + 0.1)
+            graphics::hist(pct_vals, breaks = brks, col = "#4A90D9", border = "white",
+                           main = plot_label,
+                           xlab = "Percentage (%)", ylab = "Frequency",
+                           las = 1, ylim = c(0, y_max))
+            graphics::abline(v = avg_val, col = "#E74C3C", lwd = 2, lty = 2)
+            graphics::abline(v = med_val, col = "#2ECC71", lwd = 2, lty = 2)
+            graphics::legend("topright",
+                             legend = c(
+                               sprintf("Mean: %.2f%%", avg_val),
+                               sprintf("Median: %.2f%%", med_val),
+                               sprintf("Std Dev: %.2f%%", sd_val)
+                             ),
+                             col = c("#E74C3C", "#2ECC71", NA),
+                             lwd = c(2, 2, NA), lty = c(2, 2, NA),
+                             bty = "n", cex = 1.1)
+          }, res = 120)
+        })
+        plot_tags <- c(plot_tags, list(
+          plotOutput(plot_id, height = "350px"),
+          tags$br()
+        ))
+      }
+      if (ti < length(targets)) {
+        plot_tags <- c(plot_tags, list(tags$hr()))
+      }
+    }
+    do.call(tagList, plot_tags)
+  })
+
   # --- Results: Earth Output ---
   output$earth_output <- renderPrint({
     req(rv$result)
@@ -2003,7 +2206,8 @@ function(input, output, session) {
       tryCatch({
         render_report(rv$result,
                       output_format = fmt,
-                      output_file = out_path)
+                      output_file = out_path,
+                      paper_size = earthUI:::locale_paper_())
         setProgress(1, detail = "Done")
         session$sendCustomMessage("download_check",
                                   list(id = "export_report_btn"))
@@ -2016,6 +2220,241 @@ function(input, output, session) {
         showNotification(paste("Export error:", e$message),
                          type = "error", duration = 15)
       })
+    })
+  })
+
+  # --- 8. Generate Sales Grid & Download ---
+  # Step 1: Button click shows modal with recommended comps
+  observeEvent(input$sales_grid_btn, {
+    req(rv$rca_df)
+    rca <- rv$rca_df
+    n_total <- nrow(rca)
+    if (n_total < 2) {
+      showNotification("Need at least 2 rows (subject + 1 comp).",
+                       type = "error", duration = 8)
+      return()
+    }
+
+    # Compute gross_adj_pct for all weight > 0 rows (exclude subject row 1)
+    has_gross_pct <- "gross_adjustments" %in% colnames(rca) &&
+                     "sale_price" %in% colnames(rca)
+    wt_col <- if ("weight" %in% colnames(rca)) rca[["weight"]] else rep(1, n_total)
+
+    # Build comp info table (rows 2..n_total with weight > 0)
+    comp_info <- data.frame(
+      row       = 2:n_total,
+      id        = if ("id" %in% colnames(rca)) rca[["id"]][2:n_total] else 2:n_total,
+      address   = if ("street_address" %in% colnames(rca)) {
+                    rca[["street_address"]][2:n_total]
+                  } else rep("", n_total - 1),
+      sale_price = if ("sale_price" %in% colnames(rca)) {
+                     rca[["sale_price"]][2:n_total]
+                   } else rep(NA, n_total - 1),
+      sale_age  = if ("sale_age" %in% colnames(rca)) {
+                    rca[["sale_age"]][2:n_total]
+                  } else rep(NA, n_total - 1),
+      weight    = wt_col[2:n_total],
+      gross_adj = if ("gross_adjustments" %in% colnames(rca)) {
+                    rca[["gross_adjustments"]][2:n_total]
+                  } else rep(0, n_total - 1),
+      stringsAsFactors = FALSE
+    )
+
+    # Compute gross_adj_pct
+    comp_info$gross_adj_pct <- ifelse(
+      !is.na(comp_info$sale_price) & comp_info$sale_price != 0,
+      abs(comp_info$gross_adj / comp_info$sale_price),
+      NA
+    )
+
+    # Filter: weight > 0 only
+    eligible <- comp_info[!is.na(comp_info$weight) & comp_info$weight > 0, ]
+
+    # Sort all eligible by gross_adj_pct ascending
+    eligible <- eligible[order(eligible$gross_adj_pct, na.last = TRUE), ]
+
+    # Recommended: gross_adj_pct < 0.25, then sort by sale_age ascending
+    recommended <- eligible[!is.na(eligible$gross_adj_pct) &
+                            eligible$gross_adj_pct < 0.25, ]
+    recommended <- recommended[order(recommended$sale_age, na.last = TRUE), ]
+
+    # Cap at 30
+    if (nrow(recommended) > 30) recommended <- recommended[1:30, ]
+
+    # Others not recommended (for "add more" section)
+    others <- eligible[is.na(eligible$gross_adj_pct) |
+                       eligible$gross_adj_pct >= 0.25, ]
+    others <- others[order(others$gross_adj_pct, na.last = TRUE), ]
+
+    # Store for the confirm handler
+    rv$sg_recommended <- recommended
+    rv$sg_others <- others
+
+    # Build modal UI
+    rec_checks <- if (nrow(recommended) > 0) {
+      lapply(seq_len(nrow(recommended)), function(i) {
+        r <- recommended[i, ]
+        lbl <- sprintf("Row %d | %s | SP: $%s | Age: %s | Gross: %.1f%%",
+                       r$row,
+                       substr(as.character(r$address), 1, 30),
+                       formatC(r$sale_price, format = "f", digits = 0,
+                               big.mark = ","),
+                       as.character(r$sale_age),
+                       r$gross_adj_pct * 100)
+        tags$div(
+          checkboxInput(paste0("sg_rec_", r$row), lbl, value = TRUE),
+          style = "margin-bottom: 0px;"
+        )
+      })
+    } else {
+      tags$p("No comps with gross adjustment < 25% found.",
+             style = "color: var(--bs-secondary-color);")
+    }
+
+    other_checks <- if (nrow(others) > 0) {
+      lapply(seq_len(min(nrow(others), 50)), function(i) {
+        r <- others[i, ]
+        pct_str <- if (!is.na(r$gross_adj_pct)) {
+          sprintf("%.1f%%", r$gross_adj_pct * 100)
+        } else "N/A"
+        lbl <- sprintf("Row %d | %s | SP: $%s | Age: %s | Gross: %s",
+                       r$row,
+                       substr(as.character(r$address), 1, 30),
+                       formatC(r$sale_price, format = "f", digits = 0,
+                               big.mark = ","),
+                       as.character(r$sale_age),
+                       pct_str)
+        tags$div(
+          checkboxInput(paste0("sg_rec_", r$row), lbl, value = FALSE),
+          style = "margin-bottom: 0px;"
+        )
+      })
+    } else NULL
+
+    showModal(modalDialog(
+      title = "Sales Grid — Select Comparables (max 30)",
+      size = "l",
+      tags$div(
+        style = "max-height: 500px; overflow-y: auto;",
+        tags$h5(paste0("Recommended Comps (gross adj < 25%, ",
+                       "sorted by sale age) — ",
+                       nrow(recommended), " found")),
+        rec_checks,
+        if (!is.null(other_checks)) {
+          tagList(
+            hr(),
+            tags$h5("Additional Comps (gross adj >= 25%)"),
+            other_checks
+          )
+        }
+      ),
+      footer = tagList(
+        modalButton("Cancel"),
+        actionButton("sg_confirm", "Generate Sales Grid",
+                     class = "btn-success")
+      )
+    ))
+  })
+
+  # Step 2: Confirm button in modal — generate the grid
+
+  observeEvent(input$sg_confirm, {
+    req(rv$rca_df)
+    removeModal()
+
+    # Collect checked rows from both recommended and others
+    all_candidate_rows <- c(
+      if (!is.null(rv$sg_recommended) && nrow(rv$sg_recommended) > 0)
+        rv$sg_recommended$row else integer(0),
+      if (!is.null(rv$sg_others) && nrow(rv$sg_others) > 0)
+        rv$sg_others$row[seq_len(min(nrow(rv$sg_others), 50))] else integer(0)
+    )
+    comp_rows <- integer(0)
+    for (r in all_candidate_rows) {
+      cb_val <- input[[paste0("sg_rec_", r)]]
+      if (!is.null(cb_val) && isTRUE(cb_val)) {
+        comp_rows <- c(comp_rows, r)
+      }
+    }
+
+    if (length(comp_rows) == 0) {
+      showNotification("No comps selected.", type = "warning", duration = 8)
+      return()
+    }
+    if (length(comp_rows) > 30) {
+      comp_rows <- comp_rows[1:30]
+      showNotification("Capped at 30 comps.", type = "warning", duration = 5)
+    }
+
+    # Sort selected comps by gross_adj_pct ascending
+    rca <- rv$rca_df
+    sp <- if ("sale_price" %in% colnames(rca)) rca[["sale_price"]][comp_rows] else rep(NA, length(comp_rows))
+    gross <- if ("gross_adjustments" %in% colnames(rca)) rca[["gross_adjustments"]][comp_rows] else rep(0, length(comp_rows))
+    gap <- ifelse(!is.na(sp) & sp != 0, abs(gross / sp), NA)
+    comp_rows <- comp_rows[order(gap, na.last = TRUE)]
+
+    folder <- input$output_folder
+    if (is.null(folder) || !nzchar(folder)) folder <- path.expand("~/Downloads")
+    if (!dir.exists(folder)) dir.create(folder, recursive = TRUE)
+
+    out_path <- file.path(folder, paste0("SalesGrid_",
+                          format(Sys.time(), "%Y%m%d_%H%M%S"), ".xlsx"))
+
+    message("earthUI: Sales grid with ", length(comp_rows),
+            " comps (rows: ", paste(comp_rows, collapse = ","), ")")
+
+    tryCatch({
+      tmp_adj <- tempfile(fileext = ".xlsx")
+      writexl::write_xlsx(rv$rca_df, tmp_adj)
+
+      grid_script <- system.file("app", "sales_grid.R", package = "earthUI")
+      if (!nzchar(grid_script)) {
+        showNotification("Sales grid script not found in package.",
+                         type = "error", duration = 10)
+        return()
+      }
+      source(grid_script, local = TRUE)
+
+      # Build specials named list from designations
+      sg_specials_map <- list()
+      sg_input <- input$col_specials
+      if (!is.null(sg_input)) {
+        for (nm in names(sg_input)) {
+          sp_type <- sg_input[[nm]]
+          if (sp_type != "no") sg_specials_map[[sp_type]] <- nm
+        }
+      }
+
+      n_comp <- length(comp_rows)
+      n_sheet <- ceiling(n_comp / 3)
+      withProgress(
+        message = "Generating Sales Grid",
+        detail = sprintf("0 of %d comps processed", n_comp),
+        value = 0, {
+        generate_sales_grid(
+          adjusted_file     = tmp_adj,
+          comp_rows         = comp_rows,
+          output_file       = out_path,
+          specials          = sg_specials_map,
+          progress_fn       = function(sheet, total_sheets, comps_done, total_comps) {
+            setProgress(
+              value = comps_done / total_comps,
+              detail = sprintf("Sheet %d of %d — %d of %d comps processed",
+                               sheet, total_sheets, comps_done, total_comps))
+          }
+        )
+      })
+      unlink(tmp_adj)
+
+      showNotification(paste0("Sales grid saved to: ", out_path,
+                              " (", length(comp_rows), " comps, ",
+                              ceiling(length(comp_rows) / 3), " sheets)"),
+                       type = "message", duration = 10)
+      session$sendCustomMessage("download_check",
+        list(id = "sales_grid_btn"))
+    }, error = function(e) {
+      showNotification(paste("Sales grid error:", e$message),
+                       type = "error", duration = 10)
     })
   })
 
@@ -2199,7 +2638,36 @@ function(input, output, session) {
         }
       }
 
-      writexl::write_xlsx(export_df, file)
+      # Move ranking columns to the left: residual_sf, cqa_sf, residual, cqa
+      rank_cols <- c("residual_sf", "cqa_sf", "residual", "cqa")
+      rank_cols <- rank_cols[rank_cols %in% names(export_df)]
+      if (length(rank_cols) > 0L) {
+        other_cols <- setdiff(names(export_df), rank_cols)
+        export_df <- export_df[, c(rank_cols, other_cols), drop = FALSE]
+      }
+
+      # Write with openxlsx for cell formatting
+      wb <- openxlsx::createWorkbook()
+      openxlsx::addWorksheet(wb, "Data")
+      openxlsx::writeData(wb, "Data", export_df)
+      # Apply number formats to specific columns
+      col_names <- names(export_df)
+      fmt_map <- list(
+        residual_sf = "#,##0.00",
+        cqa_sf      = "0.00",
+        residual    = "#,##0",
+        cqa         = "0.00"
+      )
+      for (cn in names(fmt_map)) {
+        ci <- match(cn, col_names)
+        if (!is.na(ci)) {
+          openxlsx::addStyle(wb, "Data",
+            style = openxlsx::createStyle(numFmt = fmt_map[[cn]]),
+            rows = 2:(nrow(export_df) + 1L), cols = ci,
+            gridExpand = TRUE, stack = TRUE)
+        }
+      }
+      openxlsx::saveWorkbook(wb, file, overwrite = TRUE)
       session$sendCustomMessage("download_check", list(id = btn_id))
     }, error = function(e) {
       msg <- paste("Download error:", conditionMessage(e))
@@ -2457,6 +2925,12 @@ function(input, output, session) {
       # Use 'actual' which has imputed prices for weight-0 rows
       export_df[["net_adjustments"]]      <- round(adj_sum, 1)
       export_df[["gross_adjustments"]]    <- round(gross_sum, 1)
+
+      # Percentage columns (adjustment / comparable sale price)
+      export_df[["residual_pct"]]   <- round(resid_adj / actual, 4)
+      export_df[["net_adj_pct"]]    <- round(adj_sum / actual, 4)
+      export_df[["gross_adj_pct"]]  <- round(gross_sum / actual, 4)
+
       export_df[["adjusted_sale_price"]]  <- round(actual + adj_sum, 1)
 
       # --- Additional targets (e.g., rent) for weight-0 rows only ---
@@ -2472,12 +2946,9 @@ function(input, output, session) {
           # Column name prefix for this target (e.g., "rent")
           tp <- tgt2
 
-          # Predictions for this target
+          # Predictions for this target (all rows)
           predicted2 <- as.numeric(pred_mat[, ri2])
-          export_df[[paste0("est_", tp)]] <- NA_real_
-          export_df[[paste0("est_", tp)]][zero_wt] <- round(predicted2[zero_wt], 1)
-          # Subject prediction
-          export_df[[paste0("est_", tp)]][1L] <- round(predicted2[1L], 1)
+          export_df[[paste0("est_", tp)]] <- round(predicted2, 1)
 
           # Residuals for comps with weight > 0 (for CQA interpolation)
           actual2 <- export_df[[tgt2]]
@@ -2530,9 +3001,7 @@ function(input, output, session) {
           actual2[zero_wt] <- sv2
           resid2 <- actual2 - predicted2
 
-          export_df[[paste0(tp, "_residual")]] <- NA_real_
-          export_df[[paste0(tp, "_residual")]][1L] <- round(resid2[1L], 1)
-          export_df[[paste0(tp, "_residual")]][zero_wt] <- round(resid2[zero_wt], 1)
+          export_df[[paste0(tp, "_residual")]] <- round(resid2, 1)
 
           # Per-g-function contributions and adjustments for this target
           intercept2 <- NULL
@@ -2546,9 +3015,7 @@ function(input, output, session) {
           }
 
           basis2 <- if (!is.null(intercept2)) intercept2$terms[[1]]$coefficient else 0
-          export_df[[paste0(tp, "_basis")]] <- NA_real_
-          export_df[[paste0(tp, "_basis")]][1L] <- round(basis2, 1)
-          export_df[[paste0(tp, "_basis")]][zero_wt] <- round(basis2, 1)
+          export_df[[paste0(tp, "_basis")]] <- round(basis2, 1)
 
           adj_sum2 <- rep(0, nrow(export_df))
           gross_sum2 <- rep(0, nrow(export_df))
@@ -2560,40 +3027,36 @@ function(input, output, session) {
 
             contrib2 <- earthUI:::eval_g_function_(model, grp, pred_df,
                                                      response_idx = ri2)
-            export_df[[contrib_col2]] <- NA_real_
-            export_df[[contrib_col2]][1L] <- round(contrib2[1L], 1)
-            export_df[[contrib_col2]][zero_wt] <- round(contrib2[zero_wt], 1)
+            export_df[[contrib_col2]] <- round(contrib2, 1)
 
             subj_contrib2 <- contrib2[1L]
             adj2 <- subj_contrib2 - contrib2
-            export_df[[adj_col2]] <- NA_real_
-            export_df[[adj_col2]][1L] <- round(adj2[1L], 1)
-            export_df[[adj_col2]][zero_wt] <- round(adj2[zero_wt], 1)
+            export_df[[adj_col2]] <- round(adj2, 1)
 
             adj_sum2 <- adj_sum2 + adj2
             gross_sum2 <- gross_sum2 + abs(adj2)
           }
 
           resid_adj2 <- subj_resid2_total - resid2
-          export_df[[paste0(tp, "_residual_adjustment")]] <- NA_real_
-          export_df[[paste0(tp, "_residual_adjustment")]][1L] <- round(resid_adj2[1L], 1)
-          export_df[[paste0(tp, "_residual_adjustment")]][zero_wt] <- round(resid_adj2[zero_wt], 1)
+          export_df[[paste0(tp, "_residual_adjustment")]] <- round(resid_adj2, 1)
           adj_sum2 <- adj_sum2 + resid_adj2
           gross_sum2 <- gross_sum2 + abs(resid_adj2)
 
-          export_df[[paste0(tp, "_net_adjustments")]] <- NA_real_
-          export_df[[paste0(tp, "_net_adjustments")]][1L] <- round(adj_sum2[1L], 1)
-          export_df[[paste0(tp, "_net_adjustments")]][zero_wt] <- round(adj_sum2[zero_wt], 1)
-          export_df[[paste0(tp, "_gross_adjustments")]] <- NA_real_
-          export_df[[paste0(tp, "_gross_adjustments")]][1L] <- round(gross_sum2[1L], 1)
-          export_df[[paste0(tp, "_gross_adjustments")]][zero_wt] <- round(gross_sum2[zero_wt], 1)
-          export_df[[paste0("adjusted_", tp)]] <- NA_real_
-          export_df[[paste0("adjusted_", tp)]][1L] <- round(actual2[1L] + adj_sum2[1L], 1)
-          export_df[[paste0("adjusted_", tp)]][zero_wt] <- round(actual2[zero_wt] + adj_sum2[zero_wt], 1)
+          export_df[[paste0(tp, "_net_adjustments")]]   <- round(adj_sum2, 1)
+          export_df[[paste0(tp, "_gross_adjustments")]]  <- round(gross_sum2, 1)
+
+          # Percentage columns for additional targets
+          export_df[[paste0(tp, "_residual_pct")]]  <- round(resid_adj2 / actual2, 4)
+          export_df[[paste0(tp, "_net_adj_pct")]]    <- round(adj_sum2 / actual2, 4)
+          export_df[[paste0(tp, "_gross_adj_pct")]]  <- round(gross_sum2 / actual2, 4)
+
+          export_df[[paste0("adjusted_", tp)]] <- round(actual2 + adj_sum2, 1)
         }
       }
 
       writexl::write_xlsx(export_df, file)
+      rv$rca_df <- export_df
+      rv$rca_targets <- targets
       session$sendCustomMessage("download_check", list(id = "rca_output_btn"))
       showNotification(paste0("RCA output saved to: ", file),
                        type = "message", duration = 8)
